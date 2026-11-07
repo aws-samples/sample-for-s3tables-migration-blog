@@ -1,0 +1,515 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Data-generation stack for S3 Tables migration blog post. Provisions an
+  EMR Serverless Spark application and runs the parquet dataset-creation
+  job (TPCDS -> blogdb in the Glue Data Catalog). The stack waits for the
+  job to finish before reporting status.
+
+Parameters:
+  ScriptBucketName:
+    Description: >
+      Name of the bucket where you uploaded the data-generation Spark script.
+      The EMR Serverless job runs the script directly from this bucket. It
+      also receives the data bucket's server access logs under data-bucket/,
+      so its bucket policy must allow the logging.s3.amazonaws.com service
+      principal to write there (see PREREQUISITES.md). Must be in the same
+      Region and account as this stack.
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  ScriptKey:
+    Description: >
+      Object key of the Spark script within ScriptBucketName.
+    Type: String
+    Default: scripts/emr-s-create-tpcds-parquet-datasets.py
+  SourceDataBucketName:
+    Description: >
+      Bucket holding the TPC-DS source data the Spark script reads.
+      Must match the path hardcoded in the Spark script.
+    Type: String
+    Default: blogpost-sparkoneks-us-east-1
+  SourceDataPrefix:
+    Description: >
+      Key prefix (no leading slash, trailing slash required) of the TPC-DS
+      store_sales data within SourceDataBucketName.
+    Type: String
+    Default: blog/BLOG_TPCDS-TEST-3T-partitioned/store_sales/
+  GlueDatabaseName:
+    Description: >
+      Glue database the Spark script creates and writes tables into.
+      Must match PQT_DATABASE_NAME in the Spark script.
+    Type: String
+    Default: blogdb
+  JobTimeoutSeconds:
+    Description: >
+      Maximum time the stack waits for the EMR Serverless job to finish before
+      failing. WaitCondition limit is 43200 seconds (12 hours).
+    Type: Number
+    Default: 43200
+    MinValue: 600
+    MaxValue: 43200
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Data bucket: private, owner-enforced, encrypted, versioned, access-logged,
+  # TLS-only.
+  # ---------------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Join ['-', ['migration-blog-testdata', !Ref AWS::AccountId]]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      # Access logs go to the script bucket: it's created before the stack,
+      # outlives it, and isn't the bucket being logged (no logging loop).
+      LoggingConfiguration:
+        DestinationBucketName: !Ref ScriptBucketName
+        LogFilePrefix: data-bucket/
+      LifecycleConfiguration:
+        Rules:
+          # Re-runs overwrite the generated data; don't keep old versions around.
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub '${DataBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---------------------------------------------------------------------------
+  # EMR Serverless Spark application (the data-gen compute).
+  # ---------------------------------------------------------------------------
+  EMRServerlessApplication:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      Name: blog-datagen-parquet
+      ReleaseLabel: emr-7.14.0
+      Type: Spark
+      Architecture: "ARM64"
+      MaximumCapacity:
+        Cpu: 400 vCPU
+        Memory: 3000 GB
+      AutoStartConfiguration:
+        Enabled: true
+      AutoStopConfiguration:
+        Enabled: true
+        IdleTimeoutMinutes: 15
+
+  # ---------------------------------------------------------------------------
+  # EMR Serverless job execution role.
+  # Assumable only by EMR Serverless, and only for this application.
+  # S3 and Glue access scoped to exactly what the Spark script touches.
+  # ---------------------------------------------------------------------------
+  EMRServerlessJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}_EMRS_Job_Execution_Role
+      Description: "Execution role for the EMR Serverless parquet data-gen job"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: emr-serverless.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !GetAtt EMRServerlessApplication.Arn
+      Policies:
+        - PolicyName: ReadScript
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ScriptBucketName}/${ScriptKey}
+        - PolicyName: ReadSourceData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${SourceDataBucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Sub ${SourceDataPrefix}*
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${SourceDataBucketName}/${SourceDataPrefix}*
+        - PolicyName: ReadWriteDataBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:ListBucketMultipartUploads
+                Resource: !GetAtt DataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub '${DataBucket.Arn}/*'
+        - PolicyName: GlueBlogDatabase
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Hive client resolves the default database on startup.
+              - Sid: ReadCatalogAndDefaultDb
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetUserDefinedFunctions
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/default/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/${GlueDatabaseName}/*
+              - Sid: ManageBlogDbAndTables
+                Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                  - glue:BatchDeletePartition
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/*
+
+  # ---------------------------------------------------------------------------
+  # Lambda-backed custom resource that submits the parquet Spark job on create,
+  # and on delete stops/deletes the app and empties the data bucket.
+  # Has its own role: only this app, only PassRole on the job role, only
+  # list/delete on the data bucket, only its own log group.
+  # ---------------------------------------------------------------------------
+  StartParquetJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/lambda/', !Join ['-', [!Select [2, !Split ['/', !Ref AWS::StackId]], start-parquet-job]]]]
+      RetentionInDays: 30
+
+  StartParquetJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartParquetJob
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt StartParquetJobLogGroup.Arn
+              - Sid: ManageThisApplication
+                Effect: Allow
+                Action:
+                  - emr-serverless:StartJobRun
+                  - emr-serverless:GetApplication
+                  - emr-serverless:StopApplication
+                  - emr-serverless:DeleteApplication
+                Resource:
+                  - !GetAtt EMRServerlessApplication.Arn
+                  - !Sub '${EMRServerlessApplication.Arn}/jobruns/*'
+              - Sid: PassJobRoleToEmrServerless
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt EMRServerlessJobRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: emr-serverless.amazonaws.com
+              # DataBucket is versioned, so emptying it means deleting every
+              # object version and delete marker, not just current objects.
+              - Sid: EmptyDataBucketOnDelete
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !GetAtt DataBucket.Arn
+              - Sid: DeleteDataBucketObjectsOnDelete
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub '${DataBucket.Arn}/*'
+
+  StartParquetJobFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: StartParquetJobLogGroup
+    Properties:
+      Description: "Submit the parquet dataset-creation EMR Serverless job"
+      FunctionName: !Join ['-', [!Select [2, !Split ['/', !Ref AWS::StackId]], start-parquet-job]]
+      Handler: index.handler
+      Role: !GetAtt StartParquetJobRole.Arn
+      Runtime: python3.12
+      # Teardown empties ~150k+ objects (and their versions) from DataBucket.
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+
+          def handler(event, context):
+              print('EVENT:[{}]'.format(event))
+              props = event.get('ResourceProperties', {})
+              if event['RequestType'] == 'Delete':
+                  try:
+                      app_id = props['ApplicationId']
+                      data_bucket = props['DataBucket']
+                      emr = boto3.client('emr-serverless')
+                      emr.stop_application(applicationId=app_id)
+                      time.sleep(30)
+                      emr.delete_application(applicationId=app_id)
+                      # Bucket is versioned: delete all versions and delete
+                      # markers so CloudFormation can remove the bucket.
+                      print("Emptying data bucket (all versions) for teardown...")
+                      boto3.resource('s3').Bucket(str(data_bucket)).object_versions.all().delete()
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  except Exception as e:
+                      print(f"Error during deletion: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {})
+              elif event['RequestType'] in ('Create', 'Update'):
+                  try:
+                      app_id = props['ApplicationId']
+                      job_role_arn = props['JobRoleArn']
+                      script_bucket = props['ScriptBucketName']
+                      script_key = props['ScriptKey']
+                      emr = boto3.client('emr-serverless')
+                      entry_point = f's3://{script_bucket}/{script_key}'
+                      print(f'Entry point: {entry_point}')
+                      spark_params = (
+                          '--conf spark.emr-serverless.driver.disk=50G '
+                          '--conf spark.driver.memory=14G '
+                          '--conf spark.driver.cores=4 '
+                          '--conf spark.emr-serverless.executor.disk=100G '
+                          '--conf spark.executor.memory=24G '
+                          '--conf spark.executor.cores=8 '
+                          '--conf spark.hadoop.hive.metastore.client.factory.class='
+                          'com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory'
+                      )
+                      data_bucket = props['DataBucket']
+                      response = emr.start_job_run(
+                          applicationId=app_id,
+                          executionRoleArn=job_role_arn,
+                          jobDriver={
+                              'sparkSubmit': {
+                                  'entryPoint': entry_point,
+                                  'entryPointArguments': [data_bucket],
+                                  'sparkSubmitParameters': spark_params
+                              }
+                          },
+                          configurationOverrides={
+                              'monitoringConfiguration': {
+                                  'managedPersistenceMonitoringConfiguration': {'enabled': True}
+                              }
+                          }
+                      )
+                      job_run_id = response['jobRunId']
+                      print(f'Submitted parquet EMR Serverless job: {job_run_id}')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'JobRunId': job_run_id})
+                  except Exception as e:
+                      print(f"Error during creation: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  StartParquetJob:
+    Type: AWS::CloudFormation::CustomResource
+    # The completion rule must exist before the job is submitted, otherwise a
+    # fast-finishing job could emit its terminal event before anyone listens.
+    DependsOn:
+      - JobCompletionRule
+      - JobCompletionSignalerPermission
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt StartParquetJobFunction.Arn
+      ApplicationId: !Ref EMRServerlessApplication
+      JobRoleArn: !GetAtt EMRServerlessJobRole.Arn
+      ScriptBucketName: !Ref ScriptBucketName
+      ScriptKey: !Ref ScriptKey
+      DataBucket: !Ref DataBucket
+
+  # ---------------------------------------------------------------------------
+  # Wait for the EMR Serverless job to reach a terminal state.
+  #
+  # A custom resource can wait at most 1 hour, which is too short for this job.
+  # Instead, an EventBridge rule catches the job's terminal state change and a
+  # small Lambda signals this WaitCondition (up to 12 hours). SUCCESS lets the
+  # stack complete; FAILED/CANCELLED fails it.
+  # ---------------------------------------------------------------------------
+  JobCompleteHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  JobCompleteWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: StartParquetJob
+    Properties:
+      Handle: !Ref JobCompleteHandle
+      Timeout: !Ref JobTimeoutSeconds
+      Count: 1
+
+  JobCompletionSignalerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/lambda/', !Join ['-', [!Select [2, !Split ['/', !Ref AWS::StackId]], job-complete-signaler]]]]
+      RetentionInDays: 30
+
+  JobCompletionSignalerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt JobCompletionSignalerLogGroup.Arn
+
+  JobCompletionSignalerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: JobCompletionSignalerLogGroup
+    Properties:
+      Description: "Signal the stack WaitCondition when the EMR Serverless job finishes"
+      FunctionName: !Join ['-', [!Select [2, !Split ['/', !Ref AWS::StackId]], job-complete-signaler]]
+      Handler: index.handler
+      Role: !GetAtt JobCompletionSignalerRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      Environment:
+        Variables:
+          WAIT_HANDLE_URL: !Ref JobCompleteHandle
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.request
+
+          def handler(event, context):
+              print('EVENT:[{}]'.format(json.dumps(event)))
+              detail = event.get('detail', {})
+              state = detail.get('state')
+              job_run_id = detail.get('jobRunId', 'unknown')
+
+              status = 'SUCCESS' if state == 'SUCCESS' else 'FAILURE'
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': f'EMR Serverless job {job_run_id} finished with state {state}',
+                  'UniqueId': job_run_id,
+                  'Data': state or 'UNKNOWN',
+              }).encode('utf-8')
+
+              # WaitCondition presigned URLs require an empty Content-Type.
+              req = urllib.request.Request(
+                  os.environ['WAIT_HANDLE_URL'],
+                  data=body,
+                  method='PUT',
+                  headers={'Content-Type': ''},
+              )
+              with urllib.request.urlopen(req) as resp:
+                  print(f'Signaled WaitCondition: {status} (HTTP {resp.status})')
+
+  JobCompletionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Catch terminal state of the blog data-gen EMR Serverless job"
+      EventPattern:
+        source: [aws.emr-serverless]
+        detail-type: [EMR Serverless Job Run State Change]
+        detail:
+          applicationId: [!Ref EMRServerlessApplication]
+          state: [SUCCESS, FAILED, CANCELLED]
+      Targets:
+        - Arn: !GetAtt JobCompletionSignalerFunction.Arn
+          Id: JobCompletionSignaler
+
+  JobCompletionSignalerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref JobCompletionSignalerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt JobCompletionRule.Arn
+
+Outputs:
+  DataBucketName:
+    Description: Bucket the Spark job writes parquet data to (blogdb location)
+    Value: !Ref DataBucket
+  EMRServerlessApplicationId:
+    Description: EMR Serverless application id
+    Value: !Ref EMRServerlessApplication
+  JobExecutionRoleArn:
+    Description: EMR Serverless job execution role ARN
+    Value: !GetAtt EMRServerlessJobRole.Arn
+  JobRunId:
+    Description: EMR Serverless job run id for the data-gen job
+    Value: !GetAtt StartParquetJob.JobRunId
